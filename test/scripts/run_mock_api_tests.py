@@ -109,7 +109,7 @@ TABLES = {
                 "extension": {},
             },
             "Tid": {
-                "label": {"en": "year", "sv": "ar"},
+                "label": {"en": "year ", "sv": "ar "},
                 "values": [{"code": "2024", "label": {"en": "2024", "sv": "2024"}}],
                 "extension": {},
             },
@@ -621,6 +621,46 @@ def main():
             "scb_variables result changed",
         )
 
+        variables_named_lang = run_query(
+            "SELECT DISTINCT language FROM scb_variables('MOCK_MAIN', lang := 'sv')",
+            base_url,
+        )
+        assert_equal(
+            variables_named_lang,
+            [{"language": "sv"}],
+            "named lang argument for scb_variables changed",
+        )
+
+        failure = run_query(
+            "SELECT * FROM scb_variables('MOCK_MAIN', 'Region')",
+            base_url,
+            expect_success=False,
+        )
+        if "No function matches" not in failure.stderr and "Candidate functions" not in failure.stderr:
+            raise AssertionError(f"unexpected error for positional scb_variables lang misuse:\n{failure.stderr}")
+
+        variables_lateral = run_query(
+            """
+            SELECT t.table_id, v.variable_code, v.variant, v.variant_name
+            FROM (SELECT 'MOCK_MAIN' AS table_id) t,
+                 LATERAL scb_variables(t.table_id) v
+            WHERE v.variable_code = 'Region'
+            ORDER BY v.variant
+            """,
+            base_url,
+        )
+        assert_equal(
+            variables_lateral,
+            [
+                {"table_id": "MOCK_MAIN", "variable_code": "Region", "variant": 0, "variant_name": "country"},
+                {"table_id": "MOCK_MAIN", "variable_code": "Region", "variant": 1, "variant_name": "country alias"},
+                {"table_id": "MOCK_MAIN", "variable_code": "Region", "variant": 2, "variant_name": "county"},
+                {"table_id": "MOCK_MAIN", "variable_code": "Region", "variant": 3, "variant_name": "county alias"},
+                {"table_id": "MOCK_MAIN", "variable_code": "Region", "variant": 4, "variant_name": "county grouped"},
+            ],
+            "scb_variables lateral use changed",
+        )
+
         values = run_query(
             "SELECT value_code, label, sort_index, parent_code, child_count, CASE WHEN is_leaf THEN 1 ELSE 0 END AS is_leaf FROM scb_values('MOCK_TREE', 'Age', lang := 'en') ORDER BY sort_index",
             base_url,
@@ -633,6 +673,43 @@ def main():
                 {"value_code": "CHILD", "label": "child", "sort_index": 2, "parent_code": "TOT", "child_count": 0, "is_leaf": 1},
             ],
             "scb_values result changed",
+        )
+
+        values_named_lang = run_query(
+            "SELECT DISTINCT language FROM scb_values('MOCK_TREE', 'Age', lang := 'sv')",
+            base_url,
+        )
+        assert_equal(
+            values_named_lang,
+            [{"language": "sv"}],
+            "named lang argument for scb_values changed",
+        )
+
+        failure = run_query(
+            "SELECT * FROM scb_values('MOCK_TREE', 'Age', 'sv')",
+            base_url,
+            expect_success=False,
+        )
+        if "No function matches" not in failure.stderr and "Candidate functions" not in failure.stderr:
+            raise AssertionError(f"unexpected error for positional scb_values lang misuse:\n{failure.stderr}")
+
+        values_lateral = run_query(
+            """
+            SELECT t.table_id, t.variable_code, v.value_code, v.label
+            FROM (SELECT 'MOCK_TREE' AS table_id, 'Age' AS variable_code) t,
+                 LATERAL scb_values(t.table_id, t.variable_code) v
+            ORDER BY v.sort_index
+            """,
+            base_url,
+        )
+        assert_equal(
+            values_lateral,
+            [
+                {"table_id": "MOCK_TREE", "variable_code": "Age", "value_code": "TOT", "label": "total"},
+                {"table_id": "MOCK_TREE", "variable_code": "Age", "value_code": "ADULT", "label": "adult"},
+                {"table_id": "MOCK_TREE", "variable_code": "Age", "value_code": "CHILD", "label": "child"},
+            ],
+            "scb_values lateral use changed",
         )
 
         variables_tree = run_query(
@@ -673,6 +750,13 @@ def main():
                 ("Population change", "DOUBLE"),
             ],
             "scb_scan schema changed",
+        )
+
+        describe_tree = run_query("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM scb_scan('MOCK_TREE'))", base_url)
+        assert_equal(
+            [(row["column_name"], row["column_type"]) for row in describe_tree],
+            [("age", "VARCHAR"), ("year", "VARCHAR"), ("Observation", "DOUBLE")],
+            "scb_scan should trim output column names",
         )
 
         scan_default = run_query(
@@ -1201,7 +1285,7 @@ def main():
         )
 
         scan_tree = run_query(
-            "SELECT age, year, Observation FROM scb_scan('MOCK_TREE', {'Age': 1}, 'en') ORDER BY age",
+            "SELECT age, year, Observation FROM scb_scan('MOCK_TREE', {'Age': 1}, lang := 'en') ORDER BY age",
             base_url,
         )
         assert_equal(
@@ -1216,6 +1300,24 @@ def main():
         failure = run_query("SELECT * FROM scb_scan('MOCK_MAIN', {'Nope': 0})", base_url, expect_success=False)
         if "Unknown SCB variant dimension" not in failure.stderr:
             raise AssertionError(f"unexpected error for invalid variant dimension:\n{failure.stderr}")
+
+        failure = run_query(
+            "SELECT * FROM scb_scan('MOCK_TREE', {'Age': 1}, 'en')",
+            base_url,
+            expect_success=False,
+        )
+        if "No function matches" not in failure.stderr and "Candidate functions" not in failure.stderr:
+            raise AssertionError(f"unexpected error for positional scb_scan lang misuse:\n{failure.stderr}")
+
+        MockScbHandler.request_counts.clear()
+        failure = run_query("SELECT * FROM scb_scan('MOCK_MAIN', 'Region')", base_url, expect_success=False)
+        if "SCB variants argument must be a STRUCT/MAP" not in failure.stderr:
+            raise AssertionError(f"unexpected error for bare string variants argument:\n{failure.stderr}")
+        assert_equal(
+            MockScbHandler.request_counts["GET /tables/MOCK_MAIN/metadata"],
+            0,
+            "invalid bare-string variants argument should fail before metadata requests",
+        )
 
         MockScbHandler.request_counts.clear()
         cached_counts = run_query(

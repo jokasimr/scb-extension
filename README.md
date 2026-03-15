@@ -6,16 +6,16 @@ The exposed interface is:
 
 - `scb_config()`: live API configuration such as languages, formats, and rate limits.
 - `scb_tables(...)`: discover available SCB tables.
-- `scb_variables(table_id, lang := 'en')`: per-variable variants for one table, including the SCB role.
-- `scb_values(table_id, variable_code, lang := 'en')`: value metadata for one variable.
-- `scb_scan(table_id, variants := NULL, lang := 'en')`: scan one SCB table at the requested variant per dimension.
-- `scb_table(table_id, variants := NULL, lang := 'en')`: alias for `scb_scan`.
+- `scb_variables(table_id, lang := 'en')`: per-variable variants for one table, including the SCB role. `lang` is keyword-only.
+- `scb_values(table_id, variable_code, lang := 'en')`: value metadata for one variable. `lang` is keyword-only.
+- `scb_scan(table_id, variants := NULL, lang := 'en')`: scan one SCB table at the requested variant per dimension. `lang` is keyword-only.
+- `scb_table(table_id, variants := NULL, lang := 'en')`: alias for `scb_scan`. `lang` is keyword-only.
 
 `scb_scan` is the main user-facing entry point. Instead of passing raw SCB selections, you pass a variant map such as:
 
 ```sql
 SELECT *
-FROM scb_scan('TAB6473', {'Region': 1, 'Kon': 0}, 'en');
+FROM scb_scan('TAB6473', {'Region': 1, 'Kon': 0}, lang := 'en');
 ```
 
 That means:
@@ -76,13 +76,22 @@ SELECT * FROM scb_config();
 SELECT * FROM scb_tables(lang := 'en') LIMIT 10;
 SELECT * FROM scb_variables('TAB6473', lang := 'en');
 SELECT * FROM scb_values('TAB6473', 'Region', lang := 'en');
+
+For lateral/correlated metadata calls, use the default language:
+
+```sql
+SELECT t.table_id, v.variable_code
+FROM some_table t, LATERAL scb_variables(t.table_id) v;
+```
+
+DuckDB 1.5 does not accept named arguments on correlated in/out table-function calls, so `lang := ...` is only available on ordinary scalar calls.
 ```
 
 Scan a table at a chosen variant:
 
 ```sql
 SELECT *
-FROM scb_scan('TAB6473', {'Region': 1, 'Kon': 0}, 'en')
+FROM scb_scan('TAB6473', {'Region': 1, 'Kon': 0}, lang := 'en')
 LIMIT 10;
 ```
 

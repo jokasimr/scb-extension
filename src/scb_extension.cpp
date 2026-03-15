@@ -109,6 +109,14 @@ struct ScbValueRow {
 	int64_t child_count = 0;
 };
 
+template <class ROW>
+struct MetadataInOutLocalState : public LocalTableFunctionState {
+	idx_t current_input_row = 0;
+	idx_t row_offset = 0;
+	bool initialized_row = false;
+	vector<ROW> rows;
+};
+
 struct ScbSelectionItem {
 	string variable_code;
 	string codelist;
@@ -1035,6 +1043,11 @@ static case_insensitive_map_t<ScbRequestedVariant> ParseVariantsJSON(const strin
 	if (trimmed.empty()) {
 		return result;
 	}
+	if (trimmed[0] != '{') {
+		throw InvalidInputException(
+		    "SCB variants argument must be a STRUCT/MAP like {'TypData': 0} or JSON object text like "
+		    "'{\"TypData\":0}', not a bare string");
+	}
 	JSONDoc doc(trimmed);
 	auto root = doc.Root();
 	if (!root || !yyjson_is_obj(root)) {
@@ -1267,9 +1280,9 @@ static unique_ptr<ColumnDataCollection> MaterializeScanRows(ClientContext &conte
 static ScbScanPlan BuildScanPlan(ClientContext &context, const string &table_id, const Value &variants_value,
                                  const string &lang) {
 	ScbScanPlan plan;
+	auto requested_variants = ParseVariantsValue(variants_value);
 	auto metadata = LoadMetadataEntry(context, table_id, lang);
 	auto derived_variants = LoadDerivedVariantsEntry(context, *metadata);
-	auto requested_variants = ParseVariantsValue(variants_value);
 	case_insensitive_set_t used_variant_keys;
 
 	for (idx_t i = 0; i < metadata->variables.size(); i++) {
@@ -1445,6 +1458,15 @@ static vector<ScbJsonStatDimension> ParseScanResponseDimensions(yyjson_val *root
 		result.push_back(std::move(dimension_row));
 	}
 	return result;
+}
+
+static string GetOutputColumnName(const string &label, const string &fallback) {
+	auto name = label.empty() ? fallback : label;
+	StringUtil::Trim(name);
+	if (name.empty()) {
+		return fallback;
+	}
+	return name;
 }
 
 static yyjson_val *GetIndexedJSONStatEntry(yyjson_val *node, idx_t index) {
@@ -1665,12 +1687,12 @@ static void BuildSelectionChunksRecursive(const vector<ScbSelectionItem> &select
 
 static void BuildScanSchema(const ScbScanPlan &plan, vector<LogicalType> &return_types, vector<string> &names) {
 	for (const auto &dimension : plan.output_dimensions) {
-		names.push_back(dimension.label.empty() ? dimension.variable_code : dimension.label);
+		names.push_back(GetOutputColumnName(dimension.label, dimension.variable_code));
 		return_types.push_back(LogicalType::VARCHAR);
 	}
 	if (!plan.metric_variable_code.empty()) {
 		for (const auto &metric_column : plan.metric_columns) {
-			names.push_back(metric_column.label.empty() ? metric_column.value_code : metric_column.label);
+			names.push_back(GetOutputColumnName(metric_column.label, metric_column.value_code));
 			return_types.push_back(LogicalType::DOUBLE);
 		}
 	} else {
@@ -1842,6 +1864,22 @@ struct RowBindData : public FunctionData {
 	}
 
 	vector<ROW> rows;
+};
+
+struct ScbMetadataBindData : public FunctionData {
+	explicit ScbMetadataBindData(string default_lang_p) : default_lang(std::move(default_lang_p)) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ScbMetadataBindData>(*this);
+	}
+
+	bool Equals(const FunctionData &other) const override {
+		auto &other_bind = other.Cast<ScbMetadataBindData>();
+		return default_lang == other_bind.default_lang;
+	}
+
+	string default_lang;
 };
 
 static unique_ptr<GlobalTableFunctionState> InitSimpleOffsetState(ClientContext &context, TableFunctionInitInput &input) {
@@ -2046,14 +2084,57 @@ static unique_ptr<FunctionData> ScbVariablesBind(ClientContext &context, TableFu
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
 
-	if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
-		throw BinderException("scb_variables(table_id) requires a non-null table_id");
+	if (!input.inputs.empty()) {
+		if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+			throw BinderException("scb_variables(table_id) requires a non-null table_id");
+		}
+	} else if (input.input_table_types.size() != 1) {
+		throw BinderException("scb_variables(table_id) requires exactly one argument");
 	}
-	const auto table_id = input.inputs[0].ToString();
-	const auto lang = GetNamedStringOrDefault(input.named_parameters, "lang", "en");
+	return make_uniq<ScbMetadataBindData>(GetNamedStringOrDefault(input.named_parameters, "lang", "en"));
+}
+
+static string GetRequiredVarcharArgument(const DataChunk &input, idx_t row_idx, idx_t column_idx,
+                                         const string &function_name, const string &argument_name) {
+	if (column_idx >= input.ColumnCount()) {
+		throw InvalidInputException("%s is missing argument \"%s\"", function_name, argument_name);
+	}
+	auto value = input.GetValue(column_idx, row_idx);
+	if (value.IsNull()) {
+		throw InvalidInputException("%s requires a non-null %s", function_name, argument_name);
+	}
+	return value.ToString();
+}
+
+static unique_ptr<FunctionData> ScbValuesBind(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"table_id", "language", "variable_code", "value_code", "label", "sort_index",
+	         "parent_code", "child_count", "is_leaf"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::BOOLEAN};
+
+	if (!input.inputs.empty()) {
+		if (input.inputs.size() != 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+			throw BinderException("scb_values(table_id, variable_code) requires non-null table_id and variable_code");
+		}
+	} else if (input.input_table_types.size() != 2) {
+		throw BinderException("scb_values(table_id, variable_code) requires exactly two arguments");
+	}
+	return make_uniq<ScbMetadataBindData>(GetNamedStringOrDefault(input.named_parameters, "lang", "en"));
+}
+
+template <class ROW>
+static unique_ptr<LocalTableFunctionState> InitMetadataInOutState(ExecutionContext &context, TableFunctionInitInput &input,
+                                                                  GlobalTableFunctionState *global_state) {
+	return make_uniq<MetadataInOutLocalState<ROW>>();
+}
+
+static void LoadVariableRows(ClientContext &context, const string &table_id, const string &lang,
+                             vector<ScbVariableRow> &rows) {
 	auto metadata = LoadMetadataEntry(context, table_id, lang);
 	auto variants = LoadDerivedVariantsEntry(context, *metadata);
-	vector<ScbVariableRow> rows;
+	rows.clear();
 	for (const auto &variable : metadata->variables) {
 		if (IsMetricRole(variable.role)) {
 			continue;
@@ -2076,98 +2157,127 @@ static unique_ptr<FunctionData> ScbVariablesBind(ClientContext &context, TableFu
 			rows.push_back(std::move(row));
 		}
 	}
-	return make_uniq<RowBindData<ScbVariableRow>>(std::move(rows));
 }
 
-static void ScbVariablesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = data_p.bind_data->Cast<RowBindData<ScbVariableRow>>();
-	auto &state = data_p.global_state->Cast<SimpleOffsetGlobalState>();
-	idx_t count = 0;
-	while (state.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		const auto &row = data.rows[state.offset++];
-		output.SetValue(0, count, row.table_id);
-		output.SetValue(1, count, row.language);
-		output.SetValue(2, count, row.variable_code);
-		output.SetValue(3, count, row.role);
-		output.SetValue(4, count, Value::BIGINT(row.variant));
-		output.SetValue(5, count, row.variant_name);
-		output.SetValue(6, count, row.variant_kind);
-		output.SetValue(7, count, Value::BIGINT(row.member_count));
-		count++;
-	}
-	output.SetCardinality(count);
-}
-
-static unique_ptr<FunctionData> ScbValuesBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"table_id", "language", "variable_code", "value_code", "label", "sort_index",
-	         "parent_code", "child_count", "is_leaf"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                LogicalType::BOOLEAN};
-
-	if (input.inputs.size() != 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
-		throw BinderException("scb_values(table_id, variable_code) requires non-null arguments");
-	}
-	const auto table_id = input.inputs[0].ToString();
-	const auto variable_code = input.inputs[1].ToString();
-	const auto lang = GetNamedStringOrDefault(input.named_parameters, "lang", "en");
+static void LoadValueRows(ClientContext &context, const string &table_id, const string &variable_code, const string &lang,
+                          vector<ScbValueRow> &rows) {
 	auto entry = LoadMetadataEntry(context, table_id, lang);
 	auto variable = FindVariableMetadata(*entry, variable_code);
-	vector<ScbValueRow> filtered;
-	if (variable) {
-		filtered.reserve(variable->values.size());
-		for (const auto &value : variable->values) {
-			ScbValueRow row;
-			row.table_id = table_id;
-			row.language = lang;
-			row.variable_code = variable_code;
-			row.value_code = value.value_code;
-			row.label = value.label;
-			row.sort_index = value.sort_index;
-			row.parent_code = value.parent_code;
-			row.child_count = value.child_count;
-			filtered.push_back(std::move(row));
-		}
+	rows.clear();
+	if (!variable) {
+		return;
 	}
-	return make_uniq<RowBindData<ScbValueRow>>(std::move(filtered));
+	rows.reserve(variable->values.size());
+	for (const auto &value : variable->values) {
+		ScbValueRow row;
+		row.table_id = table_id;
+		row.language = lang;
+		row.variable_code = variable_code;
+		row.value_code = value.value_code;
+		row.label = value.label;
+		row.sort_index = value.sort_index;
+		row.parent_code = value.parent_code;
+		row.child_count = value.child_count;
+		rows.push_back(std::move(row));
+	}
 }
 
-static void ScbValuesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = data_p.bind_data->Cast<RowBindData<ScbValueRow>>();
-	auto &state = data_p.global_state->Cast<SimpleOffsetGlobalState>();
-	idx_t count = 0;
-	while (state.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		const auto &row = data.rows[state.offset++];
-		output.SetValue(0, count, row.table_id);
-		output.SetValue(1, count, row.language);
-		output.SetValue(2, count, row.variable_code);
-		output.SetValue(3, count, row.value_code);
-		output.SetValue(4, count, row.label);
-		output.SetValue(5, count, Value::BIGINT(row.sort_index));
-		output.SetValue(6, count, row.parent_code);
-		output.SetValue(7, count, Value::BIGINT(row.child_count));
-		output.SetValue(8, count, row.child_count == 0);
-		count++;
+static OperatorResultType ScbVariablesFunction(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
+                                               DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<ScbMetadataBindData>();
+	auto &state = data_p.local_state->Cast<MetadataInOutLocalState<ScbVariableRow>>();
+	while (true) {
+		if (!state.initialized_row) {
+			if (state.current_input_row >= input.size()) {
+				state.current_input_row = 0;
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+			const auto table_id = GetRequiredVarcharArgument(input, state.current_input_row, 0,
+			                                                "scb_variables(table_id)", "table_id");
+			LoadVariableRows(context.client, table_id, bind_data.default_lang, state.rows);
+			state.row_offset = 0;
+			state.initialized_row = true;
+		}
+		if (state.row_offset >= state.rows.size()) {
+			state.current_input_row++;
+			state.initialized_row = false;
+			continue;
+		}
+
+		idx_t count = 0;
+		while (state.row_offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+			const auto &row = state.rows[state.row_offset++];
+			output.SetValue(0, count, row.table_id);
+			output.SetValue(1, count, row.language);
+			output.SetValue(2, count, row.variable_code);
+			output.SetValue(3, count, row.role);
+			output.SetValue(4, count, Value::BIGINT(row.variant));
+			output.SetValue(5, count, row.variant_name);
+			output.SetValue(6, count, row.variant_kind);
+			output.SetValue(7, count, Value::BIGINT(row.member_count));
+			count++;
+		}
+		output.SetCardinality(count);
+		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
-	output.SetCardinality(count);
+}
+
+static OperatorResultType ScbValuesFunction(ExecutionContext &context, TableFunctionInput &data_p, DataChunk &input,
+                                            DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<ScbMetadataBindData>();
+	auto &state = data_p.local_state->Cast<MetadataInOutLocalState<ScbValueRow>>();
+	while (true) {
+		if (!state.initialized_row) {
+			if (state.current_input_row >= input.size()) {
+				state.current_input_row = 0;
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+			const auto table_id = GetRequiredVarcharArgument(input, state.current_input_row, 0,
+			                                                "scb_values(table_id, variable_code)", "table_id");
+			const auto variable_code =
+			    GetRequiredVarcharArgument(input, state.current_input_row, 1,
+			                             "scb_values(table_id, variable_code)", "variable_code");
+			LoadValueRows(context.client, table_id, variable_code, bind_data.default_lang, state.rows);
+			state.row_offset = 0;
+			state.initialized_row = true;
+		}
+		if (state.row_offset >= state.rows.size()) {
+			state.current_input_row++;
+			state.initialized_row = false;
+			continue;
+		}
+
+		idx_t count = 0;
+		while (state.row_offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+			const auto &row = state.rows[state.row_offset++];
+			output.SetValue(0, count, row.table_id);
+			output.SetValue(1, count, row.language);
+			output.SetValue(2, count, row.variable_code);
+			output.SetValue(3, count, row.value_code);
+			output.SetValue(4, count, row.label);
+			output.SetValue(5, count, Value::BIGINT(row.sort_index));
+			output.SetValue(6, count, row.parent_code);
+			output.SetValue(7, count, Value::BIGINT(row.child_count));
+			output.SetValue(8, count, row.child_count == 0);
+			count++;
+		}
+		output.SetCardinality(count);
+		return OperatorResultType::HAVE_MORE_OUTPUT;
+	}
 }
 
 static unique_ptr<FunctionData> ScbScanBind(ClientContext &context, TableFunctionBindInput &input,
                                             vector<LogicalType> &return_types, vector<string> &names) {
-	if (input.inputs.empty() || input.inputs.size() > 3 || input.inputs[0].IsNull()) {
-		throw BinderException("scb_scan(table_id [, variants [, lang]]) requires a non-null table_id");
+	if (input.inputs.empty() || input.inputs.size() > 2 || input.inputs[0].IsNull()) {
+		throw BinderException("scb_scan(table_id [, variants]) requires a non-null table_id");
 	}
 
 	auto table_id = input.inputs[0].ToString();
 	Value variants_value(LogicalType::VARCHAR);
-	string lang = "en";
 	if (input.inputs.size() >= 2) {
 		variants_value = input.inputs[1];
 	}
-	if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
-		lang = input.inputs[2].ToString();
-	}
+	string lang = GetNamedStringOrDefault(input.named_parameters, "lang", "en");
 
 	auto plan = BuildScanPlan(context, table_id, variants_value, lang);
 	BuildScanSchema(plan, return_types, names);
@@ -2218,6 +2328,7 @@ static TableFunction MakeScbScanFunction(const string &name, const vector<Logica
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.supports_pushdown_type = ScbScanSupportsPushdownType;
+	function.named_parameters["lang"] = LogicalType::VARCHAR;
 	return function;
 }
 
@@ -2225,7 +2336,35 @@ static TableFunctionSet MakeScbScanFunctionSet(const string &name) {
 	TableFunctionSet result(name);
 	result.AddFunction(MakeScbScanFunction(name, {LogicalType::VARCHAR}));
 	result.AddFunction(MakeScbScanFunction(name, {LogicalType::VARCHAR, LogicalType::ANY}));
-	result.AddFunction(MakeScbScanFunction(name, {LogicalType::VARCHAR, LogicalType::ANY, LogicalType::VARCHAR}));
+	return result;
+}
+
+static TableFunction MakeScbVariablesFunction(const vector<LogicalType> &arguments) {
+	auto function =
+	    TableFunction("scb_variables", arguments, nullptr, ScbVariablesBind, nullptr,
+	                  InitMetadataInOutState<ScbVariableRow>);
+	function.in_out_function = ScbVariablesFunction;
+	function.named_parameters["lang"] = LogicalType::VARCHAR;
+	return function;
+}
+
+static TableFunctionSet MakeScbVariablesFunctionSet() {
+	TableFunctionSet result("scb_variables");
+	result.AddFunction(MakeScbVariablesFunction({LogicalType::VARCHAR}));
+	return result;
+}
+
+static TableFunction MakeScbValuesFunction(const vector<LogicalType> &arguments) {
+	auto function = TableFunction("scb_values", arguments, nullptr, ScbValuesBind, nullptr,
+	                              InitMetadataInOutState<ScbValueRow>);
+	function.in_out_function = ScbValuesFunction;
+	function.named_parameters["lang"] = LogicalType::VARCHAR;
+	return function;
+}
+
+static TableFunctionSet MakeScbValuesFunctionSet() {
+	TableFunctionSet result("scb_values");
+	result.AddFunction(MakeScbValuesFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}));
 	return result;
 }
 
@@ -2239,17 +2378,8 @@ static void RegisterFunctions(ExtensionLoader &loader) {
 	scb_tables.named_parameters["include_discontinued"] = LogicalType::BOOLEAN;
 	scb_tables.named_parameters["past_days"] = LogicalType::BIGINT;
 	loader.RegisterFunction(scb_tables);
-
-	auto scb_variables =
-	    TableFunction("scb_variables", {LogicalType::VARCHAR}, ScbVariablesFunction, ScbVariablesBind,
-	                  InitSimpleOffsetState);
-	scb_variables.named_parameters["lang"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(scb_variables);
-
-	auto scb_values = TableFunction("scb_values", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ScbValuesFunction,
-	                                ScbValuesBind, InitSimpleOffsetState);
-	scb_values.named_parameters["lang"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(scb_values);
+	loader.RegisterFunction(MakeScbVariablesFunctionSet());
+	loader.RegisterFunction(MakeScbValuesFunctionSet());
 
 	loader.RegisterFunction(MakeScbScanFunctionSet("scb_scan"));
 	loader.RegisterFunction(MakeScbScanFunctionSet("scb_table"));
