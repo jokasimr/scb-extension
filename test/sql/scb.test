@@ -1,0 +1,17 @@
+# name: test/sql/scb.test
+# description: test exposed scb extension surface
+# group: [sql]
+
+require scb
+
+query TT
+SELECT DISTINCT function_name, function_type
+FROM duckdb_functions()
+WHERE function_name IN ('scb_config', 'scb_scan', 'scb_tables', 'scb_values', 'scb_variables')
+ORDER BY function_name;
+----
+scb_config	table
+scb_scan	table
+scb_tables	table
+scb_values	table
+scb_variables	table
